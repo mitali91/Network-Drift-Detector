@@ -1,4 +1,5 @@
 # 📡 Network Config Drift Detector
+[![CI](https://github.com/mitali91/network-troubleshooter/actions/workflows/ci.yml/badge.svg)](https://github.com/mitali91/network-troubleshooter/actions/workflows/ci.yml)
 
 A Python CLI tool that compares live network device configurations against **golden configs stored in Git** and flags any drift — with severity ratings, section-by-section diff, and JSON export.
 
