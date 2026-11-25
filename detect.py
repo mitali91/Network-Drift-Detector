@@ -3,7 +3,7 @@
 network-drift-detector: Detects configuration drift between live network
 devices and golden configs stored in Git.
 
-Supports Cisco IOS, Palo Alto NGFW, and Aruba/MIST devices.
+Supports Cisco IOS, Palo Alto NGFW, and AWS VPC/MIST devices.
 Runs in mock mode out of the box — no devices required.
 
 Usage:
@@ -29,14 +29,14 @@ Examples:
   python detect.py --mock                              # run demo with sample configs
   python detect.py --mock --device cisco               # mock Cisco only
   python detect.py --mock --device paloalto            # mock Palo Alto only
-  python detect.py --mock --device aruba               # mock Aruba only
+  python detect.py --mock --device aws               # mock AWS VPC only
   python detect.py --device cisco --host 10.0.0.1 --username admin --password secret
   python detect.py --mock --save reports/drift.json    # save report to JSON
         """
     )
     parser.add_argument(
         "--device", "-d",
-        choices=["cisco", "paloalto", "aruba", "all"],
+        choices=["cisco", "paloalto", "aws", "all"],
         default="all",
         help="Device type to check (default: all)"
     )
@@ -89,7 +89,7 @@ def main():
         sys.exit(1)
 
     device_types = (
-        ["cisco", "paloalto", "aruba"]
+        ["cisco", "paloalto", "aws"]
         if args.device == "all"
         else [args.device]
     )

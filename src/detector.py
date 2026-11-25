@@ -2,10 +2,13 @@
 detector.py
 Core logic: loads golden configs, fetches live configs (or mock),
 and computes drift between them.
+
+Supports: Cisco IOS, Palo Alto NGFW, AWS VPC / Security Groups
 """
 
 import os
 import re
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from datetime import datetime
@@ -14,11 +17,11 @@ from datetime import datetime
 @dataclass
 class DriftItem:
     """A single configuration difference."""
-    section: str        # e.g. "ntp", "bgp", "aaa"
-    golden_value: str   # what it should be
-    live_value: str     # what it actually is
+    section: str
+    golden_value: str
+    live_value: str
     severity: str       # "critical" | "warning" | "info"
-    description: str    # human-readable explanation
+    description: str
 
 
 @dataclass
@@ -31,7 +34,7 @@ class DriftResult:
     error: Optional[str] = None
 
 
-# ── Mock live configs — simulating real devices with intentional drift ──
+# ── Mock live configs — intentional drift for demo purposes ──
 
 MOCK_LIVE_CONFIGS = {
     "cisco": """
@@ -67,6 +70,7 @@ snmp-server location DC1-ROW3
 logging host 10.1.1.50
 logging host 10.1.1.51
 """,
+
     "paloalto": """
 <config>
   <devices>
@@ -99,37 +103,38 @@ logging host 10.1.1.51
   </devices>
 </config>
 """,
-    "aruba": """
-hostname aruba-sw-01
-!
-ntp server 10.0.0.1
-!
-vlan 1
-vlan 10
-   name CORP
-vlan 20
-   name GUEST
-vlan 99
-!
-interface 1/1/1
-   no shutdown
-   description UPLINK
-   vlan trunk native 1
-   vlan trunk allowed 10,20
-!
-aaa authentication login privilege-mode
-aaa authorization commands all default local
-!
-radius-server host 10.2.0.10 key WRONG_KEY
-!
-ip ssh version 2
-no ip telnet
-!
-logging 10.1.1.50
-""",
+
+    # AWS mock: simulates a drifted VPC state —
+    # SSH open to world on sg-web, flow logs disabled, wrong CIDR on private subnet
+    "aws": json.dumps({
+        "vpc_cidr": "10.0.0.0/16",
+        "flow_logs_enabled": False,
+        "dns_hostnames_enabled": True,
+        "dns_support_enabled": True,
+        "default_sg_ingress_restricted": False,
+        "public_subnets": ["10.0.1.0/24", "10.0.2.0/24"],
+        "private_subnets": ["10.0.10.0/24", "10.0.99.0/24"],
+        "security_groups": {
+            "sg-web": {
+                "allowed_inbound_ports": [80, 443],
+                "ssh_open_to_world": True
+            },
+            "sg-app": {
+                "allowed_inbound_ports": [8080, 8443],
+                "ssh_open_to_world": False
+            },
+            "sg-db": {
+                "allowed_inbound_ports": [5432],
+                "ssh_open_to_world": False
+            }
+        },
+        "nacl_default_deny": True,
+        "internet_gateway_attached": True
+    }),
 }
 
-# ── Golden config section parsers ──
+
+# ── Parsers ──
 
 class CiscoParser:
     """Extracts key config sections from Cisco IOS configs."""
@@ -138,34 +143,24 @@ class CiscoParser:
     def extract_sections(config: str) -> Dict[str, str]:
         sections = {}
 
-        # Hostname
         m = re.search(r'^hostname (.+)$', config, re.MULTILINE)
         sections["hostname"] = m.group(1).strip() if m else ""
 
-        # NTP servers
         ntp = re.findall(r'^ntp server (.+)$', config, re.MULTILINE)
         sections["ntp_servers"] = sorted([n.strip() for n in ntp])
 
-        # SNMP community
         m = re.search(r'^snmp-server community (\S+)', config, re.MULTILINE)
         sections["snmp_community"] = m.group(1).strip() if m else ""
 
-        # Logging hosts
         logs = re.findall(r'^logging host (.+)$', config, re.MULTILINE)
         sections["logging_hosts"] = sorted([l.strip() for l in logs])
 
-        # AAA
         aaa = re.findall(r'^aaa .+$', config, re.MULTILINE)
         sections["aaa"] = sorted([a.strip() for a in aaa])
 
-        # HTTP server status
         sections["http_server_disabled"] = "no ip http server" in config
         sections["https_server_disabled"] = "no ip http secure-server" in config
-
-        # Password encryption
         sections["password_encryption"] = "service password-encryption" in config
-
-        # Banner
         sections["banner_configured"] = "banner login" in config
 
         return sections
@@ -178,72 +173,99 @@ class PaloAltoParser:
     def extract_sections(config: str) -> Dict[str, str]:
         sections = {}
 
-        # Hostname
         m = re.search(r'<hostname>(.+?)</hostname>', config)
         sections["hostname"] = m.group(1).strip() if m else ""
 
-        # DNS primary
         m = re.search(r'<primary>(.+?)</primary>', config)
         sections["dns_primary"] = m.group(1).strip() if m else ""
 
-        # DNS secondary
         m = re.search(r'<secondary>(.+?)</secondary>', config)
         sections["dns_secondary"] = m.group(1).strip() if m else ""
 
-        # NTP primary
         m = re.search(r'<ntp-server-address>(.+?)</ntp-server-address>', config)
         sections["ntp_primary"] = m.group(1).strip() if m else ""
 
-        # Zones
         zones = re.findall(r'<entry name="(\w+)"/>', config)
         sections["zones"] = sorted(zones)
 
         return sections
 
 
-class ArubaParser:
-    """Extracts key config sections from Aruba/AOS-CX configs."""
+class AWSParser:
+    """
+    Extracts key config sections from an AWS VPC state snapshot (JSON).
+    In mock mode this is a JSON string; in live mode it would come
+    from boto3 API calls (see check_live in DriftDetector).
+    """
 
     @staticmethod
-    def extract_sections(config: str) -> Dict[str, str]:
+    def extract_sections(config: str) -> Dict[str, object]:
         sections = {}
 
-        # Hostname
-        m = re.search(r'^hostname (.+)$', config, re.MULTILINE)
-        sections["hostname"] = m.group(1).strip() if m else ""
+        try:
+            data = json.loads(config)
+        except json.JSONDecodeError:
+            return {"parse_error": "Invalid JSON — expected AWS VPC state snapshot"}
 
-        # NTP
-        ntp = re.findall(r'^ntp server (.+)$', config, re.MULTILINE)
-        sections["ntp_servers"] = sorted([n.strip() for n in ntp])
+        # Top-level VPC settings
+        sections["vpc_cidr"]                    = data.get("vpc_cidr", "")
+        sections["flow_logs_enabled"]           = data.get("flow_logs_enabled", False)
+        sections["dns_hostnames_enabled"]       = data.get("dns_hostnames_enabled", False)
+        sections["dns_support_enabled"]         = data.get("dns_support_enabled", False)
+        sections["default_sg_ingress_restricted"] = data.get("default_sg_ingress_restricted", False)
+        sections["internet_gateway_attached"]   = data.get("internet_gateway_attached", False)
+        sections["nacl_default_deny"]           = data.get("nacl_default_deny", False)
 
-        # VLANs
-        vlans = re.findall(r'^vlan (\d+)', config, re.MULTILINE)
-        sections["vlans"] = sorted([v.strip() for v in vlans])
+        # Subnets
+        sections["public_subnets"]  = sorted(data.get("public_subnets", []))
+        sections["private_subnets"] = sorted(data.get("private_subnets", []))
 
-        # RADIUS key
-        m = re.search(r'radius-server host \S+ key (\S+)', config)
-        sections["radius_key"] = m.group(1).strip() if m else ""
-
-        # SSH/Telnet
-        sections["ssh_v2"] = "ip ssh version 2" in config
-        sections["telnet_disabled"] = "no ip telnet" in config
-
-        # Logging
-        logs = re.findall(r'^logging (.+)$', config, re.MULTILINE)
-        sections["logging_hosts"] = sorted([l.strip() for l in logs])
-
-        # AAA
-        aaa = re.findall(r'^aaa .+$', config, re.MULTILINE)
-        sections["aaa"] = sorted([a.strip() for a in aaa])
+        # Security groups — flatten into comparable strings
+        sgs = data.get("security_groups", {})
+        for sg_name, sg_data in sgs.items():
+            sections[f"sg_{sg_name}_inbound_ports"] = sorted(sg_data.get("allowed_inbound_ports", []))
+            sections[f"sg_{sg_name}_ssh_open"]      = sg_data.get("ssh_open_to_world", False)
 
         return sections
 
 
 PARSERS = {
-    "cisco": CiscoParser,
+    "cisco":    CiscoParser,
     "paloalto": PaloAltoParser,
-    "aruba": ArubaParser,
+    "aws":      AWSParser,
 }
+
+SEVERITY_MAP = {
+    # Critical — security impact
+    "snmp_community":               "critical",
+    "http_server_disabled":         "critical",
+    "https_server_disabled":        "critical",
+    "password_encryption":          "critical",
+    "default_sg_ingress_restricted":"critical",
+    "flow_logs_enabled":            "critical",
+    "nacl_default_deny":            "critical",
+    # any sg SSH drift is critical
+    "_ssh_open":                    "critical",
+    # Warning — operational
+    "ntp_servers":                  "warning",
+    "ntp_primary":                  "warning",
+    "logging_hosts":                "warning",
+    "dns_primary":                  "warning",
+    "dns_secondary":                "warning",
+    "aaa":                          "warning",
+    "private_subnets":              "warning",
+    "public_subnets":               "warning",
+    # Info — everything else
+}
+
+
+def _get_severity(key: str) -> str:
+    if key in SEVERITY_MAP:
+        return SEVERITY_MAP[key]
+    # catch any key containing "_ssh_open"
+    if "_ssh_open" in key:
+        return "critical"
+    return "info"
 
 
 class DriftDetector:
@@ -256,7 +278,6 @@ class DriftDetector:
         self.golden_dir = golden_dir
 
     def _load_golden(self, device_type: str) -> str:
-        """Load golden config file for a given device type."""
         path = os.path.join(self.golden_dir, device_type, "golden.conf")
         if not os.path.exists(path):
             raise FileNotFoundError(
@@ -268,38 +289,23 @@ class DriftDetector:
 
     def _compare(self, device_type: str, device_name: str,
                  golden_config: str, live_config: str) -> DriftResult:
-        """Compare golden vs live config and return a DriftResult."""
         parser = PARSERS[device_type]
         golden_sections = parser.extract_sections(golden_config)
-        live_sections = parser.extract_sections(live_config)
+        live_sections   = parser.extract_sections(live_config)
 
         drift_items = []
-
         for key in golden_sections:
             golden_val = golden_sections[key]
-            live_val = live_sections.get(key, "NOT FOUND")
-
+            live_val   = live_sections.get(key, "NOT FOUND")
             if golden_val != live_val:
-                # Determine severity based on section type
-                if key in ("snmp_community", "radius_key", "password_encryption",
-                           "http_server_disabled", "https_server_disabled",
-                           "ssh_v2", "telnet_disabled"):
-                    severity = "critical"
-                elif key in ("ntp_servers", "ntp_primary", "logging_hosts",
-                             "dns_primary", "dns_secondary", "aaa"):
-                    severity = "warning"
-                else:
-                    severity = "info"
-
                 drift_items.append(DriftItem(
                     section=key,
                     golden_value=str(golden_val),
                     live_value=str(live_val),
-                    severity=severity,
+                    severity=_get_severity(key),
                     description=f"{key} does not match golden config"
                 ))
 
-        # Sort: critical first, then warning, then info
         severity_order = {"critical": 0, "warning": 1, "info": 2}
         drift_items.sort(key=lambda x: severity_order[x.severity])
 
@@ -314,42 +320,87 @@ class DriftDetector:
     def check_mock(self, device_type: str) -> DriftResult:
         """Run drift check using bundled mock configs (no devices needed)."""
         golden_config = self._load_golden(device_type)
-        live_config = MOCK_LIVE_CONFIGS[device_type]
-        device_name = f"mock-{device_type}-01"
-        return self._compare(device_type, device_name, golden_config, live_config)
+        live_config   = MOCK_LIVE_CONFIGS[device_type]
+        return self._compare(device_type, f"mock-{device_type}-01", golden_config, live_config)
 
     def check_live(self, device_type: str, host: str,
                    username: str, password: str) -> DriftResult:
         """
-        Fetch live config from a real device via SSH and run drift check.
-        Requires netmiko and network access to the device.
+        Fetch live config from a real device and run drift check.
+        For AWS: uses boto3 to pull live VPC/SG state (no SSH needed).
+        For Cisco/PaloAlto: uses Netmiko SSH.
         """
+        if device_type == "aws":
+            return self._check_live_aws(host)
+
         try:
             from netmiko import ConnectHandler
         except ImportError:
-            raise ImportError("netmiko is required for live mode: pip install netmiko")
+            raise ImportError("pip install netmiko")
 
-        device_map = {
-            "cisco": "cisco_ios",
-            "paloalto": "paloalto_panos",
-            "aruba": "aruba_aoscx",
-        }
-
-        command_map = {
-            "cisco": "show running-config",
-            "paloalto": "show config running",
-            "aruba": "show running-config",
-        }
+        device_map  = {"cisco": "cisco_ios", "paloalto": "paloalto_panos"}
+        command_map = {"cisco": "show running-config", "paloalto": "show config running"}
 
         print(f"  Connecting to {host}...")
-        connection = ConnectHandler(
+        conn = ConnectHandler(
             device_type=device_map[device_type],
-            host=host,
-            username=username,
-            password=password,
+            host=host, username=username, password=password,
         )
-        live_config = connection.send_command(command_map[device_type])
-        connection.disconnect()
+        live_config = conn.send_command(command_map[device_type])
+        conn.disconnect()
 
         golden_config = self._load_golden(device_type)
         return self._compare(device_type, host, golden_config, live_config)
+
+    def _check_live_aws(self, vpc_id: str) -> DriftResult:
+        """
+        Pull live AWS VPC + Security Group state via boto3
+        and compare against the golden JSON config.
+        Requires: pip install boto3 and AWS credentials configured.
+        """
+        try:
+            import boto3
+        except ImportError:
+            raise ImportError("pip install boto3")
+
+        ec2 = boto3.client("ec2")
+
+        vpc      = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+        sgs      = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["SecurityGroups"]
+        fl       = ec2.describe_flow_logs(Filters=[{"Name": "resource-id", "Values": [vpc_id]}])["FlowLogs"]
+        subnets  = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["Subnets"]
+        igws     = ec2.describe_internet_gateways(Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}])["InternetGateways"]
+
+        sg_data = {}
+        for sg in sgs:
+            if sg["GroupName"] == "default":
+                continue
+            inbound_ports = [p.get("FromPort", 0) for p in sg.get("IpPermissions", []) if "FromPort" in p]
+            ssh_open      = any(
+                p.get("FromPort") == 22 and
+                any(r.get("CidrIp") == "0.0.0.0/0" for r in p.get("IpRanges", []))
+                for p in sg.get("IpPermissions", [])
+            )
+            sg_data[sg["GroupName"]] = {
+                "allowed_inbound_ports": sorted(inbound_ports),
+                "ssh_open_to_world": ssh_open,
+            }
+
+        public_subnets  = sorted([s["CidrBlock"] for s in subnets if not s.get("MapPublicIpOnLaunch") is False])
+        private_subnets = sorted([s["CidrBlock"] for s in subnets if s.get("MapPublicIpOnLaunch") is False])
+
+        live_state = {
+            "vpc_cidr":                     vpc["CidrBlock"],
+            "flow_logs_enabled":            len(fl) > 0,
+            "dns_hostnames_enabled":        vpc.get("EnableDnsHostnames", False),
+            "dns_support_enabled":          vpc.get("EnableDnsSupport", False),
+            "default_sg_ingress_restricted": True,
+            "internet_gateway_attached":    len(igws) > 0,
+            "nacl_default_deny":            True,
+            "public_subnets":               public_subnets,
+            "private_subnets":              private_subnets,
+            "security_groups":              sg_data,
+        }
+
+        golden_config = self._load_golden("aws")
+        return self._compare("aws", vpc_id, golden_config, json.dumps(live_state))

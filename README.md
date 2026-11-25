@@ -1,9 +1,10 @@
 # 📡 Network Config Drift Detector
-[![CI](https://github.com/mitali91/network-troubleshooter/actions/workflows/ci.yml/badge.svg)](https://github.com/mitali91/network-troubleshooter/actions/workflows/ci.yml)
+
+[![CI](https://github.com/mitali91/Network-Drift-Detector/actions/workflows/ci.yml/badge.svg)](https://github.com/mitali91/Network-Drift-Detector/actions/workflows/ci.yml)
 
 A Python CLI tool that compares live network device configurations against **golden configs stored in Git** and flags any drift — with severity ratings, section-by-section diff, and JSON export.
 
-Supports **Cisco IOS**, **Palo Alto NGFW**, and **Aruba/AOS-CX**. Runs in mock mode out of the box — no real devices required to demo.
+Supports **Cisco IOS**, **Palo Alto NGFW**, and **AWS VPC/Security Groups**. Runs in mock mode out of the box — no real devices required to demo.
 
 ---
 
@@ -14,7 +15,7 @@ $ python detect.py --mock
 
 🔍  Checking CISCO config...
 🔍  Checking PALOALTO config...
-🔍  Checking ARUBA config...
+🔍  Checking AWS config...
 
 ════════════════════════════════════════════════════════════════
   NETWORK CONFIG DRIFT REPORT
@@ -49,7 +50,7 @@ $ python detect.py --mock
 ## Features
 
 - **Mock mode** — runs a full demo instantly with no devices needed
-- **Live mode** — SSH into real Cisco IOS, Palo Alto, or Aruba devices via Netmiko
+- **Live mode** — SSH into real Cisco IOS, Palo Alto, or AWS VPC devices via Netmiko
 - **Section-by-section diff** — NTP, SNMP, AAA, DNS, logging, security settings, and more
 - **Severity ratings** — Critical (security impact), Warning (operational), Info (cosmetic)
 - **JSON export** — machine-readable reports for ticketing or CI/CD integration
@@ -75,7 +76,7 @@ pip install -r requirements.txt
 python detect.py --mock                    # check all device types
 python detect.py --mock --device cisco     # Cisco only
 python detect.py --mock --device paloalto  # Palo Alto only
-python detect.py --mock --device aruba     # Aruba only
+python detect.py --mock --device aws     # AWS VPC only
 ```
 
 **Live mode (real devices via SSH):**
@@ -106,8 +107,8 @@ golden_configs/
 │   └── golden.conf      # Cisco IOS golden config
 ├── paloalto/
 │   └── golden.conf      # Palo Alto XML golden config
-└── aruba/
-    └── golden.conf      # Aruba AOS-CX golden config
+└── aws/
+    └── golden.conf      # AWS VPC AOS-CX golden config
 ```
 
 Update these files to reflect your desired baseline, commit to Git, and the tool will flag any device that deviates from them.
@@ -116,7 +117,7 @@ Update these files to reflect your desired baseline, commit to Git, and the tool
 
 ## What Gets Checked
 
-| Section | Cisco | Palo Alto | Aruba |
+| Section | Cisco | Palo Alto | AWS VPC |
 |---|---|---|---|
 | Hostname | ✅ | ✅ | ✅ |
 | NTP servers | ✅ | ✅ | ✅ |
@@ -155,7 +156,7 @@ network-drift-detector/
 ├── golden_configs/
 │   ├── cisco/golden.conf
 │   ├── paloalto/golden.conf
-│   └── aruba/golden.conf
+│   └── aws/golden.conf
 ├── tests/
 │   └── test_detector.py
 ├── reports/                     # Generated reports (gitignored)
@@ -169,3 +170,22 @@ network-drift-detector/
 
 **Mitali Varerkar** — Senior Cloud Network Engineer  
 [linkedin.com/in/mitalivarerkar](https://linkedin.com/in/mitalivarerkar)
+
+---
+
+## AWS VPC / Security Group Checks
+
+When checking AWS (mock or live via boto3), the following are validated against the golden config:
+
+| Check | Severity |
+|---|---|
+| Flow logs enabled | Critical |
+| Default SG ingress restricted | Critical |
+| SSH open to world (any SG) | Critical |
+| NACL default deny | Critical |
+| DNS hostnames enabled | Warning |
+| Private subnet CIDRs | Warning |
+| Public subnet CIDRs | Warning |
+| Internet gateway attached | Info |
+
+For live AWS checks, configure credentials via `aws configure` or environment variables before running.

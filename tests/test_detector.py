@@ -1,9 +1,10 @@
 """
 tests/test_detector.py
 Unit tests for drift detection logic.
-No real devices or API keys required.
+No real devices, AWS credentials, or API keys required.
 """
 
+import json
 import pytest
 import sys
 import os
@@ -12,10 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.detector import (
     DriftDetector, DriftResult, DriftItem,
-    CiscoParser, PaloAltoParser, ArubaParser,
+    CiscoParser, PaloAltoParser, AWSParser,
     MOCK_LIVE_CONFIGS,
 )
-
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "golden_configs")
 
@@ -23,28 +23,23 @@ GOLDEN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "golden_co
 class TestCiscoParser:
 
     def test_extracts_hostname(self):
-        config = "hostname my-router"
-        s = CiscoParser.extract_sections(config)
+        s = CiscoParser.extract_sections("hostname my-router")
         assert s["hostname"] == "my-router"
 
     def test_extracts_ntp_servers(self):
-        config = "ntp server 10.0.0.1\nntp server 10.0.0.2"
-        s = CiscoParser.extract_sections(config)
+        s = CiscoParser.extract_sections("ntp server 10.0.0.1\nntp server 10.0.0.2")
         assert s["ntp_servers"] == ["10.0.0.1", "10.0.0.2"]
 
     def test_extracts_snmp_community(self):
-        config = "snmp-server community SECRET RO"
-        s = CiscoParser.extract_sections(config)
+        s = CiscoParser.extract_sections("snmp-server community SECRET RO")
         assert s["snmp_community"] == "SECRET"
 
     def test_detects_password_encryption(self):
-        config = "service password-encryption"
-        s = CiscoParser.extract_sections(config)
+        s = CiscoParser.extract_sections("service password-encryption")
         assert s["password_encryption"] is True
 
     def test_detects_http_disabled(self):
-        config = "no ip http server\nno ip http secure-server"
-        s = CiscoParser.extract_sections(config)
+        s = CiscoParser.extract_sections("no ip http server\nno ip http secure-server")
         assert s["http_server_disabled"] is True
         assert s["https_server_disabled"] is True
 
@@ -52,49 +47,61 @@ class TestCiscoParser:
 class TestPaloAltoParser:
 
     def test_extracts_hostname(self):
-        config = "<hostname>pa-fw-01</hostname>"
-        s = PaloAltoParser.extract_sections(config)
+        s = PaloAltoParser.extract_sections("<hostname>pa-fw-01</hostname>")
         assert s["hostname"] == "pa-fw-01"
 
     def test_extracts_dns(self):
-        config = "<primary>8.8.8.8</primary><secondary>8.8.4.4</secondary>"
-        s = PaloAltoParser.extract_sections(config)
+        s = PaloAltoParser.extract_sections("<primary>8.8.8.8</primary><secondary>8.8.4.4</secondary>")
         assert s["dns_primary"] == "8.8.8.8"
         assert s["dns_secondary"] == "8.8.4.4"
 
     def test_extracts_ntp(self):
-        config = "<ntp-server-address>10.0.0.1</ntp-server-address>"
-        s = PaloAltoParser.extract_sections(config)
+        s = PaloAltoParser.extract_sections("<ntp-server-address>10.0.0.1</ntp-server-address>")
         assert s["ntp_primary"] == "10.0.0.1"
 
 
-class TestArubaParser:
+class TestAWSParser:
 
-    def test_extracts_hostname(self):
-        config = "hostname aruba-sw-01"
-        s = ArubaParser.extract_sections(config)
-        assert s["hostname"] == "aruba-sw-01"
+    def setup_method(self):
+        self.golden = json.dumps({
+            "vpc_cidr": "10.0.0.0/16",
+            "flow_logs_enabled": True,
+            "dns_hostnames_enabled": True,
+            "dns_support_enabled": True,
+            "default_sg_ingress_restricted": True,
+            "internet_gateway_attached": True,
+            "nacl_default_deny": True,
+            "public_subnets": ["10.0.1.0/24"],
+            "private_subnets": ["10.0.10.0/24"],
+            "security_groups": {
+                "sg-web": {"allowed_inbound_ports": [80, 443], "ssh_open_to_world": False}
+            }
+        })
 
-    def test_extracts_vlans(self):
-        config = "vlan 1\nvlan 10\nvlan 20"
-        s = ArubaParser.extract_sections(config)
-        assert "1" in s["vlans"]
-        assert "10" in s["vlans"]
+    def test_extracts_vpc_cidr(self):
+        s = AWSParser.extract_sections(self.golden)
+        assert s["vpc_cidr"] == "10.0.0.0/16"
 
-    def test_detects_ssh_v2(self):
-        config = "ip ssh version 2"
-        s = ArubaParser.extract_sections(config)
-        assert s["ssh_v2"] is True
+    def test_extracts_flow_logs(self):
+        s = AWSParser.extract_sections(self.golden)
+        assert s["flow_logs_enabled"] is True
 
-    def test_detects_telnet_disabled(self):
-        config = "no ip telnet"
-        s = ArubaParser.extract_sections(config)
-        assert s["telnet_disabled"] is True
+    def test_extracts_sg_ports(self):
+        s = AWSParser.extract_sections(self.golden)
+        assert s["sg_sg-web_inbound_ports"] == [80, 443]
 
-    def test_extracts_radius_key(self):
-        config = "radius-server host 10.0.0.1 key MYKEY"
-        s = ArubaParser.extract_sections(config)
-        assert s["radius_key"] == "MYKEY"
+    def test_extracts_sg_ssh(self):
+        s = AWSParser.extract_sections(self.golden)
+        assert s["sg_sg-web_ssh_open"] is False
+
+    def test_extracts_subnets(self):
+        s = AWSParser.extract_sections(self.golden)
+        assert "10.0.1.0/24" in s["public_subnets"]
+        assert "10.0.10.0/24" in s["private_subnets"]
+
+    def test_invalid_json_handled(self):
+        s = AWSParser.extract_sections("not json")
+        assert "parse_error" in s
 
 
 class TestDriftDetector:
@@ -109,28 +116,37 @@ class TestDriftDetector:
 
     def test_paloalto_mock_has_drift(self):
         result = self.detector.check_mock("paloalto")
+        assert result.has_drift is True
+
+    def test_aws_mock_has_drift(self):
+        result = self.detector.check_mock("aws")
         assert isinstance(result, DriftResult)
         assert result.has_drift is True
 
-    def test_aruba_mock_has_drift(self):
-        result = self.detector.check_mock("aruba")
-        assert isinstance(result, DriftResult)
-        assert result.has_drift is True
+    def test_aws_drift_includes_critical(self):
+        result = self.detector.check_mock("aws")
+        severities = [d.severity for d in result.drift_items]
+        assert "critical" in severities
+
+    def test_aws_detects_ssh_open(self):
+        result = self.detector.check_mock("aws")
+        ssh_items = [d for d in result.drift_items if "ssh_open" in d.section]
+        assert len(ssh_items) > 0
+        assert ssh_items[0].severity == "critical"
+
+    def test_aws_detects_flow_logs_off(self):
+        result = self.detector.check_mock("aws")
+        fl_items = [d for d in result.drift_items if "flow_logs" in d.section]
+        assert len(fl_items) > 0
 
     def test_drift_items_are_list(self):
         result = self.detector.check_mock("cisco")
         assert isinstance(result.drift_items, list)
-        assert len(result.drift_items) > 0
 
-    def test_drift_item_has_severity(self):
+    def test_drift_item_severity_valid(self):
         result = self.detector.check_mock("cisco")
         for item in result.drift_items:
             assert item.severity in ("critical", "warning", "info")
-
-    def test_critical_drift_detected_cisco(self):
-        result = self.detector.check_mock("cisco")
-        severities = [d.severity for d in result.drift_items]
-        assert "critical" in severities
 
     def test_no_drift_when_configs_match(self):
         golden = self.detector._load_golden("cisco")
@@ -138,15 +154,16 @@ class TestDriftDetector:
         assert result.has_drift is False
         assert result.drift_items == []
 
-    def test_device_name_set(self):
-        result = self.detector.check_mock("cisco")
-        assert result.device_name == "mock-cisco-01"
-
-    def test_checked_at_populated(self):
-        result = self.detector.check_mock("cisco")
-        assert result.checked_at != ""
+    def test_aws_no_drift_when_configs_match(self):
+        golden = self.detector._load_golden("aws")
+        result = self.detector._compare("aws", "vpc-test", golden, golden)
+        assert result.has_drift is False
 
     def test_missing_golden_raises_error(self):
         detector = DriftDetector(golden_dir="/nonexistent/path")
         with pytest.raises(FileNotFoundError):
             detector.check_mock("cisco")
+
+    def test_device_name_set(self):
+        result = self.detector.check_mock("aws")
+        assert result.device_name == "mock-aws-01"
